@@ -85,10 +85,13 @@ app01_cpp/
 │       └── sensor_node.ino          # C++ sketch: sample, frame, CRC, transmit
 ├── gateway-rpi/
 │   ├── src/
-│   │   ├── main.cpp                 # --selftest | --read <tty|file>
-│   │   ├── FrameDecoder.cpp/.h      # framing, CRC, validation gates (SR-1/2/3)
-│   │   └── NodeRegistry.cpp/.h      # per-node state, counters, quarantine (SR-4)
+│   │   ├── main.cpp                 # --selftest | --read <tty|file|-> [--verbose]
+│   │   ├── Protocol.h               # wire struct + CRC (mirror of the sketch's copy)
+│   │   ├── FrameDecoder.cpp/.h      # framing, CRC, validation gates (SR-1)
+│   │   └── NodeRegistry.cpp/.h      # sequence/rate/quarantine + aggregates (SR-2/3/4, FR-3)
 │   └── CMakeLists.txt               # -Wall -Wextra -Wpedantic -Werror -fanalyzer
+├── tools/
+│   └── frame_simulator.py           # executable protocol spec + conformance scenarios
 └── SSDLC_IoT_Sensor_Pipeline_Plan.md
 ```
 
