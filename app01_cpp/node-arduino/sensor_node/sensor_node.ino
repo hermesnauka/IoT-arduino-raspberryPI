@@ -55,6 +55,11 @@ struct Reading {
   uint16_t humidityPctX100;
 };
 
+// Explicit prototypes: the Arduino builder auto-inserts its own above this
+// struct's definition otherwise, which does not compile.
+static bool readSensor(Reading &out);
+static void sendFrame(const Reading &r, bool fault);
+
 static bool readSensor(Reading &out) {
   // Synthetic plausible values so the pipeline is exercisable without
   // hardware: slow triangle wave around 22 °C / 45 %RH.
