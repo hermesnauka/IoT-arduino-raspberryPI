@@ -102,6 +102,9 @@ app01_cpp/
 │   │   └── NodeRegistry.cpp/.h      # sequence/rate/quarantine + aggregates (SR-2/3/4, FR-3)
 │   ├── systemd/
 │   │   └── iot-gateway.service      # Phase 5 packaging: Restart=on-failure, journald, SIGUSR1 dump
+│   ├── fuzz/
+│   │   ├── fuzz_decoder.cpp         # AFL++ harness (Phase 4, stretch), opt-in BUILD_FUZZER target
+│   │   └── seeds/                   # seed corpus: valid, bad-CRC, multi-frame, garbage-prefixed
 │   └── CMakeLists.txt               # -Wall -Wextra -Wpedantic -Werror -fanalyzer
 ├── tools/
 │   └── frame_simulator.py           # executable protocol spec + conformance scenarios
@@ -121,7 +124,7 @@ app01_cpp/
 *   **SAST:** GCC `-fanalyzer` + `-Wall -Wextra -Wpedantic -Werror` baked into CMake (build fails on any finding). `arduino-cli compile` (or PlatformIO check) for the sketch if available.
 *   **Offline self-test:** `gateway --selftest` asserts: valid frame accepted; bad CRC dropped; out-of-range temperature dropped; replayed sequence ignored; reserved-nonzero dropped; quarantine engages after N consecutive errors and other nodes stay live.
 *   **Protocol conformance (Python simulator):** feeds the gateway valid frames, bit-flipped frames, truncated frames, interleaved multi-node streams, and a full-baud garbage flood; asserts counters and outputs.
-*   **Fuzzing:** decoder entry point fuzzed with random byte streams (simple Python random fuzz first; AFL++ as stretch) — the decoder must never crash or over-read.
+*   **Fuzzing:** decoder entry point fuzzed with random byte streams. Simple Python random fuzz (`frame_simulator.py`'s garbage-flood scenario) plus a deterministic in-process fuzz in `--selftest`. Stretch: coverage-guided AFL++ via `gateway-rpi/fuzz/fuzz_decoder.cpp`, an opt-in `BUILD_FUZZER` CMake target (off by default, so it never affects the required verify workflow) — the decoder must never crash or over-read.
 
 ---
 

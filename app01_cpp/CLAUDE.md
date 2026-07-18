@@ -19,6 +19,18 @@ gateway-rpi/build/gateway --selftest                                          # 
 python3 tools/frame_simulator.py --gateway gateway-rpi/build/gateway          # protocol conformance
 ```
 
+Optional stretch verify — coverage-guided fuzzing (needs `afl++` installed and
+`core_pattern` set to `core`; never use `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES`):
+
+```bash
+cmake -S gateway-rpi -B gateway-rpi/build-fuzz -DBUILD_FUZZER=ON \
+      -DCMAKE_CXX_COMPILER=afl-clang-fast++
+cmake --build gateway-rpi/build-fuzz --target fuzz_decoder
+timeout 180 afl-fuzz -i gateway-rpi/fuzz/seeds -o gateway-rpi/fuzz/findings \
+      -- gateway-rpi/build-fuzz/fuzz_decoder @@
+# pass = fuzzer_stats shows saved_crashes:0 and saved_hangs:0
+```
+
 Sketch compile check (arduino-cli is installed user-locally in `~/.local/bin`):
 
 ```bash

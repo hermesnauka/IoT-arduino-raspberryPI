@@ -16,6 +16,10 @@ cmake-build-*/
 *.o
 *.obj
 
+######### AFL++ fuzzing (app01_cpp, Plan Phase 4 stretch)
+gateway-rpi/build-fuzz/
+gateway-rpi/fuzz/findings/
+
 ######### C# / .NET (game-server-csharp)
 [Bb]in/
 [Oo]bj/
