@@ -10,6 +10,7 @@
 // SIGUSR1 dumps per-node counters on demand while running.
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -39,7 +40,14 @@ using iot::SensorFrame;
 
 // SR-6 key file: one `nodeId:32-hex-chars` per line; '#' comments and blank
 // lines ignored. Fail-closed: any malformed line rejects the whole file.
+// Group/world-accessible modes get a warning (plan §2.3 recommends 0600) —
+// advisory only, since dev setups legitimately use throwaway test keys.
 bool loadKeyFile(const char* path, KeyStore& out, std::string& err) {
+  struct stat st = {};
+  if (stat(path, &st) == 0 && (st.st_mode & 077) != 0) {
+    std::cerr << "warning: key file " << path
+              << " is group/world-accessible; recommend chmod 0600\n";
+  }
   std::ifstream in(path);
   if (!in) {
     err = "cannot open key file";

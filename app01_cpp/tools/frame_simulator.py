@@ -382,7 +382,17 @@ def scenario_auth(gw):
             + frame(2, 1)                                      # no key entry → dropped
             + frame(1, 4, key=TEST_KEY)                        # signed → accepted
         )
-        nodes, _, _ = run_gateway(gw, payload, extra_args=("--keys", keyfile))
+        # Key hygiene (plan §2.3 recommends 0600): permissive modes warn,
+        # tight modes stay quiet. Advisory only — the run still succeeds.
+        _os.chmod(keyfile, 0o644)
+        nodes, _, stderr = run_gateway(gw, payload, extra_args=("--keys", keyfile))
+        check("auth", "group/world-accessible" in stderr,
+              "0644 key file draws a permissions warning")
+        _os.chmod(keyfile, 0o600)
+        _, _, stderr = run_gateway(gw, frame(1, 1, key=TEST_KEY),
+                                   extra_args=("--keys", keyfile))
+        check("auth", "group/world-accessible" not in stderr,
+              "0600 key file loads without warning")
     n1, n2 = nodes.get(1, {}), nodes.get(2, {})
     check("auth", n1.get("valid") == 2, "correctly signed frames accepted")
     check("auth", n1.get("auth") == 2, "forged-tag and untagged frames dropped and counted")
