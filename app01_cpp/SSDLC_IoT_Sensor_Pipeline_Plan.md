@@ -148,7 +148,8 @@ app01_cpp/
 │   │   └── iot-gateway.service      # Phase 5 packaging: Restart=on-failure, journald, SIGUSR1 dump
 │   ├── fuzz/
 │   │   ├── fuzz_decoder.cpp         # AFL++ harness (Phase 4, stretch), opt-in BUILD_FUZZER target
-│   │   └── seeds/                   # seed corpus: valid, bad-CRC, multi-frame, garbage-prefixed
+│   │   └── seeds/                   # seed corpus: signed valid frame, bad-CRC, multi-frame,
+│   │                                 # garbage-prefixed, signed version-report frame
 │   └── CMakeLists.txt               # -Wall -Wextra -Wpedantic -Werror -fanalyzer
 ├── tools/
 │   └── frame_simulator.py           # executable protocol spec + conformance scenarios
