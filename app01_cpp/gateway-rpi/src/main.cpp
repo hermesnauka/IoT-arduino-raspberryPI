@@ -4,12 +4,15 @@
 //                               [--verbose] print each accepted reading
 //                               [--metrics <path>] write Prometheus textfile
 //                               metrics after each processed chunk (plan Phase 5)
+//                               [--aggregate <n>] publish per-node min/max/avg
+//                               every n accepted readings (FR-3)
 // Prints decoder + per-node stats on EOF. Exit code 0 = healthy.
 // SIGUSR1 dumps per-node counters on demand while running.
 
 #include <cstdio>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -472,7 +475,7 @@ void writeMetricsAtomic(const char* path, const NodeRegistry& reg) {
 // ---------------------------------------------------------------------------
 // Stream mode
 int runRead(const char* path, bool verbose, const char* metricsPath,
-            const char* keysPath) {
+            const char* keysPath, uint32_t aggregateEvery) {
   std::ifstream file;
   std::istream* in = &std::cin;
   if (std::strcmp(path, "-") != 0) {
@@ -496,6 +499,9 @@ int runRead(const char* path, bool verbose, const char* metricsPath,
     dec.setKeyStore(&keys);
   }
   uint32_t syntheticMs = 0;  // file replay has no wall clock; one tick per chunk
+  // FR-3 publish interval, counted in accepted sensor readings rather than
+  // wall time so replayed byte files and PTY streams behave identically.
+  uint32_t acceptedSincePublish = 0;
   std::signal(SIGUSR1, handleSigUsr1);
 
   uint8_t buf[512];
@@ -517,6 +523,16 @@ int runRead(const char* path, bool verbose, const char* metricsPath,
       switch (r.status) {
         case FrameDecoder::Status::Ok: {
           NodeRegistry::Accept verdict = reg.accept(r.frame, syntheticMs, alert);
+          if (verdict == NodeRegistry::Accept::Accepted && aggregateEvery > 0 &&
+              !(r.frame.flags & iot::kFlagVersionReport)) {
+            // Version reports carry no sensor payload (plan §2.2), so they
+            // never advance the publish interval.
+            if (++acceptedSincePublish >= aggregateEvery) {
+              acceptedSincePublish = 0;
+              reg.printAggregates(std::cout);
+              std::cout.flush();
+            }
+          }
           if (verdict == NodeRegistry::Accept::Accepted && verbose) {
             if (r.frame.flags & iot::kFlagVersionReport) {
               const NodeRegistry::NodeState& n = reg.state(r.frame.nodeId);
@@ -582,7 +598,8 @@ int runRead(const char* path, bool verbose, const char* metricsPath,
 
 namespace {
 const char kUsage[] =
-    " --selftest | --read <path|-> [--verbose] [--metrics <path>] [--keys <path>]\n";
+    " --selftest | --read <path|-> [--verbose] [--metrics <path>] [--keys <path>]"
+    " [--aggregate <n>]\n";
 }
 
 int main(int argc, char** argv) {
@@ -593,6 +610,7 @@ int main(int argc, char** argv) {
     bool verbose = false;
     const char* metricsPath = nullptr;
     const char* keysPath = nullptr;
+    uint32_t aggregateEvery = 0;  // 0 = periodic publishing off (FR-3)
     for (int i = 3; i < argc; ++i) {
       if (std::strcmp(argv[i], "--verbose") == 0) {
         verbose = true;
@@ -600,12 +618,20 @@ int main(int argc, char** argv) {
         metricsPath = argv[++i];
       } else if (std::strcmp(argv[i], "--keys") == 0 && i + 1 < argc) {
         keysPath = argv[++i];
+      } else if (std::strcmp(argv[i], "--aggregate") == 0 && i + 1 < argc) {
+        char* end = nullptr;
+        unsigned long n = std::strtoul(argv[++i], &end, 10);
+        if (end == nullptr || *end != '\0' || n == 0 || n > 1000000) {
+          std::cerr << "error: --aggregate needs a count in [1, 1000000]\n";
+          return 2;
+        }
+        aggregateEvery = static_cast<uint32_t>(n);
       } else {
         std::cerr << "usage: " << argv[0] << kUsage;
         return 2;
       }
     }
-    return runRead(argv[2], verbose, metricsPath, keysPath);
+    return runRead(argv[2], verbose, metricsPath, keysPath, aggregateEvery);
   }
   std::cerr << "usage: " << argv[0] << kUsage;
   return 2;

@@ -241,6 +241,39 @@ def scenario_firmware_version(gw):
     check("firmware", dec["framesOk"] == 3, "all three frames decode Ok")
 
 
+def scenario_aggregate_publish(gw):
+    print("scenario: periodic aggregate publishing (FR-3)")
+    # Node 1: three readings, a version report (carries no sensor payload, so
+    # it must not advance the publish interval), then the reading that
+    # completes the interval of 4 and triggers exactly one publish.
+    payload = (frame(1, 1, 20.0) + frame(1, 2, 21.0) + frame(1, 3, 22.0) +
+               version_frame(1, 4) + frame(1, 5, 23.0))
+    proc = subprocess.run([gw, "--read", "-", "--aggregate", "4"], input=payload,
+                          capture_output=True, timeout=30)
+    if proc.returncode != 0:
+        raise AssertionError(f"gateway exited {proc.returncode}: {proc.stderr.decode()}")
+    agg = [l for l in proc.stdout.decode().splitlines() if l.startswith("[aggregate]")]
+    check("aggregate", len(agg) == 1,
+          "one publish after 4 accepted sensor readings (version frame excluded)")
+    line = agg[0] if agg else ""
+    check("aggregate", "node 001 n=4" in line and "tempMin=20" in line and
+          "tempMax=23" in line and "tempAvg=21.5" in line,
+          "min/max/avg computed over the rolling window")
+
+    # Interleaved nodes: the interval counts accepted readings bus-wide, and
+    # each publish reports every node with a non-empty window.
+    payload = b"".join(frame(n, s, 20.0 + n) for s in (1, 2, 3, 4) for n in (1, 2))
+    proc = subprocess.run([gw, "--read", "-", "--aggregate", "4"], input=payload,
+                          capture_output=True, timeout=30)
+    if proc.returncode != 0:
+        raise AssertionError(f"gateway exited {proc.returncode}: {proc.stderr.decode()}")
+    agg = [l for l in proc.stdout.decode().splitlines() if l.startswith("[aggregate]")]
+    check("aggregate", len(agg) == 4 and
+          sum("node 001" in l for l in agg) == 2 and
+          sum("node 002" in l for l in agg) == 2,
+          "8 interleaved frames -> two publishes, each covering both nodes")
+
+
 def scenario_metrics_export(gw):
     print("scenario: Prometheus metrics export (Plan Phase 5, stretch)")
     import tempfile
@@ -305,7 +338,8 @@ def main():
     for scenario in (scenario_valid_stream, scenario_multi_node, scenario_bad_crc,
                      scenario_out_of_range, scenario_reserved, scenario_replay,
                      scenario_garbage_resync, scenario_flood, scenario_garbage_flood,
-                     scenario_firmware_version, scenario_metrics_export, scenario_auth):
+                     scenario_firmware_version, scenario_aggregate_publish,
+                     scenario_metrics_export, scenario_auth):
         scenario(gw)
     if FAILURES:
         print(f"\n{len(FAILURES)} scenario check(s) FAILED:")

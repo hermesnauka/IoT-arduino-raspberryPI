@@ -139,7 +139,7 @@ app01_cpp/
 │       └── sensor_node.ino          # C++ sketch: sample, frame, CRC, transmit
 ├── gateway-rpi/
 │   ├── src/
-│   │   ├── main.cpp                 # --selftest | --read <tty|file|-> [--verbose]; SIGUSR1 dumps counters
+│   │   ├── main.cpp                 # --selftest | --read <tty|file|-> [--verbose] [--aggregate <n>]; SIGUSR1 dumps counters
 │   │   ├── Protocol.h               # wire struct + CRC (mirror of the sketch's copy)
 │   │   ├── FrameDecoder.cpp/.h      # framing, CRC, validation gates (SR-1)
 │   │   └── NodeRegistry.cpp/.h      # sequence/rate/quarantine + aggregates (SR-2/3/4, FR-3)
@@ -160,6 +160,7 @@ app01_cpp/
 *   **Validation order:** magic → length → CRC → reserved-zero → range → sequence. Cheapest checks first; nothing touches `NodeRegistry` until all gates pass.
 *   **Resync on garbage:** on framing failure, slide one byte and rescan for magic — a hostile byte stream may embed fake magics, so CRC remains the authority.
 *   **Testability without hardware:** the gateway reads from any file descriptor — a recorded byte file or a PTY fed by a Python simulator stands in for the Arduino during CI. The Python frame simulator plays the same role as the UDP test clients in the shooter project: an executable specification of the protocol.
+*   **FR-3 publish leg:** `--aggregate <n>` publishes per-node min/max/avg over the rolling window every *n* accepted sensor readings. The interval is counted in readings rather than wall time so byte-file replays and live serial behave identically; version-report frames carry no sensor payload and never advance it.
 
 ---
 

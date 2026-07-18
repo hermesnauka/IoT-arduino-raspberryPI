@@ -122,6 +122,19 @@ NodeRegistry::Aggregate NodeRegistry::aggregate(uint8_t nodeId) const {
   return a;
 }
 
+void NodeRegistry::printAggregates(std::ostream& os) const {
+  for (unsigned id = 1; id < 256; ++id) {
+    Aggregate a = aggregate(static_cast<uint8_t>(id));
+    if (a.count == 0) continue;
+    os << "[aggregate] node " << std::setw(3) << std::setfill('0') << id
+       << std::setfill(' ') << " n=" << static_cast<unsigned>(a.count)
+       << " tempMin=" << a.tempMin / 100.0 << " tempMax=" << a.tempMax / 100.0
+       << " tempAvg=" << a.tempAvgCx100 / 100.0
+       << " humMin=" << a.humMin / 100.0 << " humMax=" << a.humMax / 100.0
+       << " humAvg=" << a.humAvgPctX100 / 100.0 << "\n";
+  }
+}
+
 void NodeRegistry::printStats(std::ostream& os) const {
   for (unsigned id = 1; id < 256; ++id) {
     const NodeState& n = nodes_[id];

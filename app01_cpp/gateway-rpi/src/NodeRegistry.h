@@ -93,6 +93,11 @@ class NodeRegistry {
 
   void printStats(std::ostream& os) const;
 
+  // FR-3 publish leg: one line per node with a non-empty window
+  // (min/max/avg over the rolling window). Called by main.cpp --aggregate
+  // every n accepted readings; the window keeps rolling, it is not cleared.
+  void printAggregates(std::ostream& os) const;
+
   // Prometheus text-exposition format (Plan Phase 5, stretch monitoring).
   // Intended for the node_exporter textfile collector: the caller writes
   // this to a file, not a live HTTP endpoint (see main.cpp --metrics).
