@@ -19,8 +19,9 @@ constexpr uint8_t kFlagSensorFault = 0x01;
 //   temperatureCx100 (reinterpreted as uint16): high byte = major, low byte = minor
 //   humidityPctX100 (reinterpreted as uint16):   low byte = patch, high byte reserved (0)
 constexpr uint8_t kFlagVersionReport = 0x02;
-constexpr std::size_t kFrameSize = 16;
-constexpr std::size_t kCrcCoverage = 14;  // bytes 0–13
+constexpr std::size_t kFrameSize = 24;
+constexpr std::size_t kCrcCoverage = 14;   // bytes 0–13
+constexpr std::size_t kAuthCoverage = 14;  // SipHash-2-4 tag covers the same span (SR-6, plan §2.3)
 
 // Validation ranges (SR-1)
 constexpr int16_t kTempMinCx100 = -4000;   // -40.00 °C
@@ -37,10 +38,12 @@ struct SensorFrame {
   uint16_t humidityPctX100;   // %RH × 100
   uint16_t reserved;          // must be 0
   uint16_t crc16;             // CRC-16/CCITT-FALSE over bytes 0–13
+  uint64_t authTag;           // SipHash-2-4 over bytes 0–13, per-node key (SR-6);
+                              // 0 when the node transmits unauthenticated
 };
 #pragma pack(pop)
 
-static_assert(sizeof(SensorFrame) == kFrameSize, "wire contract violated: frame must be 16 bytes");
+static_assert(sizeof(SensorFrame) == kFrameSize, "wire contract violated: frame must be 24 bytes");
 
 // CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, xorout 0.
 // Known-answer: crc16Ccitt("123456789") == 0x29B1 (checked in --selftest).

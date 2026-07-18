@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "SipHash.h"
+
 namespace iot {
 
 void FrameDecoder::push(const uint8_t* data, std::size_t len) {
@@ -61,6 +63,17 @@ bool FrameDecoder::next(Result& out) {
       ++stats_.nodeIdErrors;
       out = {Status::BadNodeId, frame};
       return true;
+    }
+    // Auth gate (SR-6): only when a KeyStore is configured. A node without a
+    // key entry fails closed. The compare is a single branch-free 64-bit
+    // XOR-and-test — no byte-wise early exit to leak timing.
+    if (keys_ != nullptr) {
+      if (!keys_->present[frame.nodeId] ||
+          ((sipHash24(keys_->keys[frame.nodeId], raw, kAuthCoverage) ^ frame.authTag) != 0)) {
+        ++stats_.authErrors;
+        out = {Status::BadAuth, frame};
+        return true;
+      }
     }
     // Version-report frames repurpose these fields for a firmware version,
     // not a physical reading — SR-1 range gates don't apply to them.

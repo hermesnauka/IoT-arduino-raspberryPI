@@ -93,6 +93,7 @@ void NodeRegistry::recordDecodeError(uint8_t claimedNodeId, ErrorKind kind,
     case ErrorKind::Crc: ++n.crcErrors; break;
     case ErrorKind::Reserved: ++n.reservedErrors; break;
     case ErrorKind::Range: ++n.rangeErrors; break;
+    case ErrorKind::Auth: ++n.authErrors; break;
   }
   noteError(n, nowMs, quarantineTriggered);
 }
@@ -125,10 +126,11 @@ void NodeRegistry::printStats(std::ostream& os) const {
   for (unsigned id = 1; id < 256; ++id) {
     const NodeState& n = nodes_[id];
     bool touched = n.seen || n.crcErrors || n.reservedErrors || n.rangeErrors ||
-                   n.replays || n.rateLimited || n.quarantineDrops;
+                   n.authErrors || n.replays || n.rateLimited || n.quarantineDrops;
     if (!touched) continue;
     os << "[node " << std::setw(3) << std::setfill('0') << id << std::setfill(' ')
        << "] valid=" << n.valid << " crc=" << n.crcErrors
+       << " auth=" << n.authErrors
        << " reserved=" << n.reservedErrors << " range=" << n.rangeErrors
        << " replay=" << n.replays << " rate=" << n.rateLimited
        << " qdrop=" << n.quarantineDrops << " quarantines=" << n.quarantineEvents
@@ -156,7 +158,7 @@ void NodeRegistry::writePrometheusText(std::ostream& os) const {
   for (unsigned id = 1; id < 256; ++id) {
     const NodeState& n = nodes_[id];
     if (n.seen || n.crcErrors || n.reservedErrors || n.rangeErrors ||
-        n.replays || n.rateLimited || n.quarantineDrops) {
+        n.authErrors || n.replays || n.rateLimited || n.quarantineDrops) {
       touched[touchedCount++] = static_cast<uint16_t>(id);
     }
   }
@@ -186,6 +188,9 @@ void NodeRegistry::writePrometheusText(std::ostream& os) const {
   emitCounter("iot_gateway_node_range_errors_total",
               "Frames dropped for an implausible reading (SR-1).",
               [](const NodeState& n) { return n.rangeErrors; });
+  emitCounter("iot_gateway_node_auth_errors_total",
+              "Frames dropped for a forged or missing auth tag (SR-6) — spoofing signal.",
+              [](const NodeState& n) { return n.authErrors; });
   emitCounter("iot_gateway_node_replay_total",
               "Stale or duplicated sequence numbers ignored (SR-2).",
               [](const NodeState& n) { return n.replays; });

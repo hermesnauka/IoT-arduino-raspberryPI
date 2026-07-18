@@ -88,10 +88,19 @@ the MAC coverage, so replay protection and authenticity are bound together.
 *   **Coverage:** bytes 0–13 (same span as the CRC): magic, nodeId, flags,
     sequence, payload, reserved. The CRC itself is derived from the same bytes
     so including it would add nothing.
+*   **Optional, switchable:** auth is off by default and the frame is always
+    24 bytes (the tag field is always present, so the decoder never guesses
+    the frame size).
+    *   *Gateway:* auth is enforced iff `--keys <path>` is given — no key
+        file means the tag is ignored (legacy/dev mode); with a key file
+        every frame must verify.
+    *   *Node:* compile-time `SENSOR_NODE_AUTH` switch (0/1) in the sketch;
+        when off, the node transmits `authTag = 0`.
 *   **Keys:** one 128-bit pre-shared key per node.
-    *   *Gateway:* loaded at startup from a key file (`--keys <path>`, one
+    *   *Gateway:* loaded at startup from the key file (one
         `nodeId:32-hex-chars` per line, recommend mode 0600); never compiled
-        in. A frame from a node with no key entry is dropped and counted.
+        in. With auth on, a frame from a node with no key entry is dropped
+        and counted.
     *   *Node:* key resides in the sketch as a `PROGMEM` constant — an
         accepted dev-grade limitation, documented here; production would move
         it to EEPROM or a secure element. Key never leaves the node.
@@ -157,7 +166,7 @@ app01_cpp/
 ## Phase 4: Verification & Testing (Security Assessment)
 
 *   **SAST:** GCC `-fanalyzer` + `-Wall -Wextra -Wpedantic -Werror` baked into CMake (build fails on any finding). `arduino-cli compile` (or PlatformIO check) for the sketch if available.
-*   **Offline self-test:** `gateway --selftest` asserts: valid frame accepted; bad CRC dropped; out-of-range temperature dropped; replayed sequence ignored; reserved-nonzero dropped; quarantine engages after N consecutive errors and other nodes stay live; (SR-6) SipHash known-answer vectors pass, valid tag accepted, forged tag dropped, tampered-frame-with-recomputed-CRC dropped by tag, unknown-node frame dropped.
+*   **Offline self-test:** `gateway --selftest` asserts: valid frame accepted; bad CRC dropped; out-of-range temperature dropped; replayed sequence ignored; reserved-nonzero dropped; quarantine engages after N consecutive errors and other nodes stay live; (SR-6) SipHash known-answer vectors pass, valid tag accepted, forged tag dropped, tampered-frame-with-recomputed-CRC dropped by tag, unknown-node frame dropped, and with auth off a zero-tag frame is accepted.
 *   **Protocol conformance (Python simulator):** feeds the gateway valid frames, bit-flipped frames, truncated frames, interleaved multi-node streams, and a full-baud garbage flood; asserts counters and outputs.
 *   **Fuzzing:** decoder entry point fuzzed with random byte streams. Simple Python random fuzz (`frame_simulator.py`'s garbage-flood scenario) plus a deterministic in-process fuzz in `--selftest`. Stretch: coverage-guided AFL++ via `gateway-rpi/fuzz/fuzz_decoder.cpp`, an opt-in `BUILD_FUZZER` CMake target (off by default, so it never affects the required verify workflow) — the decoder must never crash or over-read.
 

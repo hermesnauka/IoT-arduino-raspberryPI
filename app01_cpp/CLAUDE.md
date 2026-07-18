@@ -6,10 +6,17 @@ Design source of truth: `SSDLC_IoT_Sensor_Pipeline_Plan.md` (read before changin
 
 `SensorFrame` exists in two deliberately duplicated copies —
 `gateway-rpi/src/Protocol.h` and `node-arduino/sensor_node/sensor_node.ino` —
-plus the Python packer in `tools/frame_simulator.py` (`FRAME_FMT`). Any protocol
-change updates all three in one commit; the `static_assert(sizeof == 16)` on
-both C++ sides and the CRC known-answer test (`0x29B1` for `"123456789"`) are
-the tripwires.
+plus the Python packer in `tools/frame_simulator.py` (`FRAME_FMT`). The same
+triplication applies to SipHash-2-4 (`gateway-rpi/src/SipHash.h`, the sketch,
+and `siphash24` in the simulator). Any protocol change updates all three in
+one commit; the tripwires are the `static_assert(sizeof == 24)` on both C++
+sides, the CRC known-answer test (`0x29B1` for `"123456789"`), and the SipHash
+reference vectors (`0x726fdb47dd0e0e31` empty / `0xa129ca6149be45e5` 15-byte,
+key `00…0f`) asserted in `--selftest` and the simulator.
+
+Frame auth (SR-6) is optional: the gateway enforces it iff `--read … --keys
+<file>` is given (`nodeId:32-hex` lines); the sketch signs iff compiled with
+`-DSENSOR_NODE_AUTH=1`. Off by default on both sides.
 
 ## Verify (all three must pass before claiming done)
 

@@ -18,8 +18,11 @@ import sys
 
 MAGIC = 0xA55A
 FRAME_FMT = "<HBBIhHH"  # magic, nodeId, flags, sequence, tempCx100, humX100, reserved
-FRAME_SIZE = 16
+FRAME_SIZE = 24
 FLAG_VERSION_REPORT = 0x02  # Protocol.h kFlagVersionReport (Plan Phase 5, stretch)
+
+# Fixed test-only key (also baked into gateway --selftest — never a real key).
+TEST_KEY = bytes(range(16))
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -35,38 +38,86 @@ def crc16_ccitt(data: bytes) -> int:
 assert crc16_ccitt(b"123456789") == 0x29B1, "CRC known-answer test failed"
 
 
-def frame(node_id, seq, temp_c=22.5, hum_pct=45.0, flags=0, reserved=0, corrupt=False):
+def siphash24(key: bytes, data: bytes) -> int:
+    """SipHash-2-4 (SR-6): independent Python mirror of gateway SipHash.h."""
+    mask = 0xFFFFFFFFFFFFFFFF
+
+    def rotl(x, b):
+        return ((x << b) | (x >> (64 - b))) & mask
+
+    k0, k1 = struct.unpack("<QQ", key)
+    v0 = 0x736F6D6570736575 ^ k0
+    v1 = 0x646F72616E646F6D ^ k1
+    v2 = 0x6C7967656E657261 ^ k0
+    v3 = 0x7465646279746573 ^ k1
+
+    def sipround():
+        nonlocal v0, v1, v2, v3
+        v0 = (v0 + v1) & mask; v1 = rotl(v1, 13); v1 ^= v0; v0 = rotl(v0, 32)
+        v2 = (v2 + v3) & mask; v3 = rotl(v3, 16); v3 ^= v2
+        v0 = (v0 + v3) & mask; v3 = rotl(v3, 21); v3 ^= v0
+        v2 = (v2 + v1) & mask; v1 = rotl(v1, 17); v1 ^= v2; v2 = rotl(v2, 32)
+
+    full = len(data) & ~7
+    for off in range(0, full, 8):
+        m = struct.unpack_from("<Q", data, off)[0]
+        v3 ^= m
+        sipround(); sipround()
+        v0 ^= m
+    last = (len(data) & 0xFF) << 56
+    for i, byte in enumerate(data[full:]):
+        last |= byte << (8 * i)
+    v3 ^= last
+    sipround(); sipround()
+    v0 ^= last
+    v2 ^= 0xFF
+    sipround(); sipround(); sipround(); sipround()
+    return v0 ^ v1 ^ v2 ^ v3
+
+
+# Reference vectors_sip64 known-answer tests (key 00…0f), mirroring the
+# gateway --selftest tripwire: empty input + 15-byte partial-block input.
+assert siphash24(TEST_KEY, b"") == 0x726FDB47DD0E0E31, "SipHash KAT (empty) failed"
+assert siphash24(TEST_KEY, bytes(range(15))) == 0xA129CA6149BE45E5, "SipHash KAT (15B) failed"
+
+
+def frame(node_id, seq, temp_c=22.5, hum_pct=45.0, flags=0, reserved=0, corrupt=False,
+          key=None, corrupt_tag=False):
     body = struct.pack(FRAME_FMT, MAGIC, node_id, flags, seq,
                        int(round(temp_c * 100)), int(round(hum_pct * 100)), reserved)
     crc = crc16_ccitt(body)
     if corrupt:
         crc ^= 0xFFFF
-    out = body + struct.pack("<H", crc)
+    tag = siphash24(key, body) if key else 0
+    if corrupt_tag:
+        tag ^= 1
+    out = body + struct.pack("<HQ", crc, tag)
     assert len(out) == FRAME_SIZE
     return out
 
 
-def version_frame(node_id, seq, major=1, minor=0, patch=0):
+def version_frame(node_id, seq, major=1, minor=0, patch=0, key=None):
     """Flags-extension frame: temp/hum fields carry a firmware version."""
     packed_temp = ((major & 0xFF) << 8) | (minor & 0xFF)
     temp_raw = struct.unpack("<h", struct.pack("<H", packed_temp))[0]
     body = struct.pack(FRAME_FMT, MAGIC, node_id, FLAG_VERSION_REPORT, seq,
                        temp_raw, patch & 0xFF, 0)
     crc = crc16_ccitt(body)
-    out = body + struct.pack("<H", crc)
+    tag = siphash24(key, body) if key else 0
+    out = body + struct.pack("<HQ", crc, tag)
     assert len(out) == FRAME_SIZE
     return out
 
 
 NODE_RE = re.compile(
-    r"\[node (\d+)\] valid=(\d+) crc=(\d+) reserved=(\d+) range=(\d+) "
+    r"\[node (\d+)\] valid=(\d+) crc=(\d+) auth=(\d+) reserved=(\d+) range=(\d+) "
     r"replay=(\d+) rate=(\d+) qdrop=(\d+) quarantines=(\d+) fw=(\d+) lastSeq=(\d+)")
 DEC_RE = re.compile(
     r"\[decoder\] bytesIn=(\d+) framesOk=(\d+) crcErrors=(\d+) resyncBytes=(\d+)")
 
 
-def run_gateway(gateway, payload):
-    proc = subprocess.run([gateway, "--read", "-"], input=payload,
+def run_gateway(gateway, payload, extra_args=()):
+    proc = subprocess.run([gateway, "--read", "-", *extra_args], input=payload,
                           capture_output=True, timeout=30)
     if proc.returncode != 0:
         raise AssertionError(f"gateway exited {proc.returncode}: {proc.stderr.decode()}")
@@ -75,7 +126,7 @@ def run_gateway(gateway, payload):
     for m in NODE_RE.finditer(out):
         vals = list(map(int, m.groups()))
         nodes[vals[0]] = dict(zip(
-            ["valid", "crc", "reserved", "range", "replay", "rate", "qdrop",
+            ["valid", "crc", "auth", "reserved", "range", "replay", "rate", "qdrop",
              "quarantines", "fw", "lastSeq"], vals[1:]))
     dec = DEC_RE.search(out)
     decoder = dict(zip(["bytesIn", "framesOk", "crcErrors", "resyncBytes"],
@@ -210,6 +261,34 @@ def scenario_metrics_export(gw):
           "gauge metric type declared")
 
 
+def scenario_auth(gw):
+    print("scenario: frame authentication (SR-6, plan §2.3)")
+    import tempfile
+    import os as _os
+    with tempfile.TemporaryDirectory() as d:
+        keyfile = _os.path.join(d, "keys.txt")
+        with open(keyfile, "w") as f:
+            f.write("# test keys\n1:" + TEST_KEY.hex() + "\n")
+        payload = (
+            frame(1, 1, key=TEST_KEY)                          # signed → accepted
+            + frame(1, 2, key=TEST_KEY, corrupt_tag=True)      # forged tag → dropped
+            + frame(1, 3, temp_c=30.0)                         # valid CRC, no tag → dropped
+            + frame(2, 1)                                      # no key entry → dropped
+            + frame(1, 4, key=TEST_KEY)                        # signed → accepted
+        )
+        nodes, _, _ = run_gateway(gw, payload, extra_args=("--keys", keyfile))
+    n1, n2 = nodes.get(1, {}), nodes.get(2, {})
+    check("auth", n1.get("valid") == 2, "correctly signed frames accepted")
+    check("auth", n1.get("auth") == 2, "forged-tag and untagged frames dropped and counted")
+    check("auth", n2.get("auth") == 1 and n2.get("valid", 0) == 0,
+          "node without a key entry fails closed")
+    check("auth", n1.get("lastSeq") == 4, "sequence state fed only by authentic frames")
+    # Auth off (no --keys): the same zero-tag frame is accepted (optional mode).
+    nodes, _, _ = run_gateway(gw, frame(3, 1))
+    check("auth", nodes.get(3, {}).get("valid") == 1,
+          "zero-tag frame accepted when auth is off")
+
+
 def scenario_garbage_flood(gw):
     print("scenario: 64 KiB random flood (fuzz — decoder must survive)")
     rng = random.Random(0xC0FFEE)
@@ -226,7 +305,7 @@ def main():
     for scenario in (scenario_valid_stream, scenario_multi_node, scenario_bad_crc,
                      scenario_out_of_range, scenario_reserved, scenario_replay,
                      scenario_garbage_resync, scenario_flood, scenario_garbage_flood,
-                     scenario_firmware_version, scenario_metrics_export):
+                     scenario_firmware_version, scenario_metrics_export, scenario_auth):
         scenario(gw)
     if FAILURES:
         print(f"\n{len(FAILURES)} scenario check(s) FAILED:")

@@ -15,17 +15,72 @@
 #include <iostream>
 #include <istream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 #include "FrameDecoder.h"
 #include "NodeRegistry.h"
 #include "Protocol.h"
+#include "SipHash.h"
 
 namespace {
 
 using iot::FrameDecoder;
+using iot::KeyStore;
 using iot::NodeRegistry;
 using iot::SensorFrame;
+
+// SR-6 key file: one `nodeId:32-hex-chars` per line; '#' comments and blank
+// lines ignored. Fail-closed: any malformed line rejects the whole file.
+bool loadKeyFile(const char* path, KeyStore& out, std::string& err) {
+  std::ifstream in(path);
+  if (!in) {
+    err = "cannot open key file";
+    return false;
+  }
+  std::string line;
+  int lineNo = 0;
+  while (std::getline(in, line)) {
+    ++lineNo;
+    if (line.empty() || line[0] == '#') continue;
+    std::size_t colon = line.find(':');
+    if (colon == std::string::npos || line.size() != colon + 1 + 32) {
+      err = "line " + std::to_string(lineNo) + ": expected nodeId:32-hex-chars";
+      return false;
+    }
+    unsigned long id = 0;
+    try {
+      std::size_t used = 0;
+      id = std::stoul(line.substr(0, colon), &used);
+      if (used != colon) throw std::invalid_argument("trailing junk");
+    } catch (const std::exception&) {
+      err = "line " + std::to_string(lineNo) + ": bad node id";
+      return false;
+    }
+    if (id < 1 || id > 255) {
+      err = "line " + std::to_string(lineNo) + ": node id out of range 1-255";
+      return false;
+    }
+    for (int i = 0; i < 16; ++i) {
+      unsigned byte = 0;
+      for (int nib = 0; nib < 2; ++nib) {
+        char c = line[colon + 1 + i * 2 + nib];
+        unsigned v;
+        if (c >= '0' && c <= '9') v = static_cast<unsigned>(c - '0');
+        else if (c >= 'a' && c <= 'f') v = static_cast<unsigned>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v = static_cast<unsigned>(c - 'A' + 10);
+        else {
+          err = "line " + std::to_string(lineNo) + ": bad hex digit";
+          return false;
+        }
+        byte = (byte << 4) | v;
+      }
+      out.keys[id][i] = static_cast<uint8_t>(byte);
+    }
+    out.present[id] = true;
+  }
+  return true;
+}
 
 // SIGUSR1 dumps per-node counters to stdout on demand (Plan Phase 5:
 // journald captures stdout under systemd, so `systemctl kill -s SIGUSR1
@@ -39,7 +94,8 @@ void handleSigUsr1(int /*signum*/) { g_dumpRequested = 1; }
 // Frame construction helper (used by self-test only; the real producer is the
 // Arduino sketch / Python simulator).
 SensorFrame makeFrame(uint8_t nodeId, uint32_t seq, int16_t tempCx100,
-                      uint16_t humPctX100, uint8_t flags = 0, uint16_t reserved = 0) {
+                      uint16_t humPctX100, uint8_t flags = 0, uint16_t reserved = 0,
+                      const uint8_t* key = nullptr) {
   SensorFrame f{};
   f.magic = iot::kMagic;
   f.nodeId = nodeId;
@@ -51,8 +107,13 @@ SensorFrame makeFrame(uint8_t nodeId, uint32_t seq, int16_t tempCx100,
   uint8_t raw[iot::kFrameSize];
   std::memcpy(raw, &f, iot::kFrameSize);
   f.crc16 = iot::crc16Ccitt(raw, iot::kCrcCoverage);
+  f.authTag = key ? iot::sipHash24(key, raw, iot::kAuthCoverage) : 0;
   return f;
 }
+
+// Fixed test-only key (also baked into frame_simulator.py — never a real key).
+const uint8_t kTestKey[16] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                              0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f};
 
 // Builds a flags-extension version-report frame (Protocol.h kFlagVersionReport).
 SensorFrame makeVersionFrame(uint8_t nodeId, uint32_t seq, uint8_t major, uint8_t minor,
@@ -82,7 +143,7 @@ int g_failures = 0;
   } while (0)
 
 void testWireContract() {
-  static_assert(sizeof(SensorFrame) == 16);
+  static_assert(sizeof(SensorFrame) == 24);
   // Runtime little-endian check: the wire is LE; a BE host would need byte
   // swaps in the decoder (not supported — fail loudly instead of corrupting).
   uint16_t probe = 0x0102;
@@ -91,6 +152,56 @@ void testWireContract() {
   CHECK(first == 0x02);
   // CRC-16/CCITT-FALSE known-answer test.
   CHECK(iot::crc16Ccitt(reinterpret_cast<const uint8_t*>("123456789"), 9) == 0x29B1);
+  // SipHash-2-4 known-answer tests (reference vectors_sip64, key 00…0f):
+  // empty input, and a 15-byte input 00…0e exercising the partial-block path.
+  const uint8_t seq15[15] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+  CHECK(iot::sipHash24(kTestKey, seq15, 0) == 0x726fdb47dd0e0e31ULL);
+  CHECK(iot::sipHash24(kTestKey, seq15, 15) == 0xa129ca6149be45e5ULL);
+}
+
+void testAuthGate() {
+  KeyStore ks;
+  ks.present[1] = true;
+  std::memcpy(ks.keys[1], kTestKey, 16);
+
+  FrameDecoder dec;
+  dec.setKeyStore(&ks);
+
+  // Correctly signed frame accepted.
+  pushFrame(dec, makeFrame(1, 1, 2250, 4500, 0, 0, kTestKey));
+  FrameDecoder::Result r{};
+  CHECK(dec.next(r));
+  CHECK(r.status == FrameDecoder::Status::Ok);
+
+  // Forged tag dropped.
+  SensorFrame forged = makeFrame(1, 2, 2250, 4500, 0, 0, kTestKey);
+  forged.authTag ^= 1;
+  pushFrame(dec, forged);
+  CHECK(dec.next(r));
+  CHECK(r.status == FrameDecoder::Status::BadAuth);
+
+  // Tampered payload with a recomputed CRC but a stale tag: the CRC gate
+  // passes, the auth gate catches it — the exact spoofing scenario (SR-6).
+  SensorFrame tampered = makeFrame(1, 3, 2250, 4500, 0, 0, kTestKey);
+  tampered.temperatureCx100 = 3000;
+  uint8_t raw[iot::kFrameSize];
+  std::memcpy(raw, &tampered, iot::kFrameSize);
+  tampered.crc16 = iot::crc16Ccitt(raw, iot::kCrcCoverage);
+  pushFrame(dec, tampered);
+  CHECK(dec.next(r));
+  CHECK(r.status == FrameDecoder::Status::BadAuth);
+
+  // Node with no key entry fails closed, even with tag = 0.
+  pushFrame(dec, makeFrame(2, 1, 2250, 4500));
+  CHECK(dec.next(r));
+  CHECK(r.status == FrameDecoder::Status::BadAuth);
+  CHECK(dec.stats().authErrors == 3);
+
+  // Auth off (no KeyStore): a zero-tag frame is accepted (plan §2.3).
+  FrameDecoder open;
+  pushFrame(open, makeFrame(2, 1, 2250, 4500));
+  CHECK(open.next(r));
+  CHECK(r.status == FrameDecoder::Status::Ok);
 }
 
 void testValidFrameAccepted() {
@@ -291,6 +402,7 @@ void testFuzzDecoderNeverCrashes() {
             r.status == FrameDecoder::Status::BadCrc ||
             r.status == FrameDecoder::Status::BadReserved ||
             r.status == FrameDecoder::Status::BadNodeId ||
+            r.status == FrameDecoder::Status::BadAuth ||
             r.status == FrameDecoder::Status::BadRange);
     }
   }
@@ -311,6 +423,7 @@ void testSigUsr1SetsDumpFlag() {
 
 int runSelfTest() {
   testWireContract();
+  testAuthGate();
   testValidFrameAccepted();
   testBadCrcDropped();
   testOutOfRangeDropped();
@@ -358,7 +471,8 @@ void writeMetricsAtomic(const char* path, const NodeRegistry& reg) {
 
 // ---------------------------------------------------------------------------
 // Stream mode
-int runRead(const char* path, bool verbose, const char* metricsPath) {
+int runRead(const char* path, bool verbose, const char* metricsPath,
+            const char* keysPath) {
   std::ifstream file;
   std::istream* in = &std::cin;
   if (std::strcmp(path, "-") != 0) {
@@ -372,6 +486,15 @@ int runRead(const char* path, bool verbose, const char* metricsPath) {
 
   FrameDecoder dec;
   NodeRegistry reg;
+  KeyStore keys;  // auth enforced iff --keys given (plan §2.3)
+  if (keysPath) {
+    std::string err;
+    if (!loadKeyFile(keysPath, keys, err)) {
+      std::cerr << "error: key file " << keysPath << ": " << err << "\n";
+      return 2;  // fail closed: never run half-configured auth
+    }
+    dec.setKeyStore(&keys);
+  }
   uint32_t syntheticMs = 0;  // file replay has no wall clock; one tick per chunk
   std::signal(SIGUSR1, handleSigUsr1);
 
@@ -422,6 +545,10 @@ int runRead(const char* path, bool verbose, const char* metricsPath) {
           reg.recordDecodeError(r.frame.nodeId, NodeRegistry::ErrorKind::Reserved,
                                 syntheticMs, alert);
           break;
+        case FrameDecoder::Status::BadAuth:
+          reg.recordDecodeError(r.frame.nodeId, NodeRegistry::ErrorKind::Auth,
+                                syntheticMs, alert);
+          break;
         case FrameDecoder::Status::BadRange:
           std::cerr << "ALERT node " << static_cast<unsigned>(r.frame.nodeId)
                     << ": out-of-range reading dropped (possible tamper)\n";
@@ -445,6 +572,7 @@ int runRead(const char* path, bool verbose, const char* metricsPath) {
             << " crcErrors=" << s.crcErrors << " resyncBytes=" << s.resyncBytes
             << " rangeErrors=" << s.rangeErrors
             << " reservedErrors=" << s.reservedErrors
+            << " authErrors=" << s.authErrors
             << " bytesDropped=" << s.bytesDropped << "\n";
   reg.printStats(std::cout);
   return 0;
@@ -454,7 +582,7 @@ int runRead(const char* path, bool verbose, const char* metricsPath) {
 
 namespace {
 const char kUsage[] =
-    " --selftest | --read <path|-> [--verbose] [--metrics <path>]\n";
+    " --selftest | --read <path|-> [--verbose] [--metrics <path>] [--keys <path>]\n";
 }
 
 int main(int argc, char** argv) {
@@ -464,17 +592,20 @@ int main(int argc, char** argv) {
   if (argc >= 3 && std::strcmp(argv[1], "--read") == 0) {
     bool verbose = false;
     const char* metricsPath = nullptr;
+    const char* keysPath = nullptr;
     for (int i = 3; i < argc; ++i) {
       if (std::strcmp(argv[i], "--verbose") == 0) {
         verbose = true;
       } else if (std::strcmp(argv[i], "--metrics") == 0 && i + 1 < argc) {
         metricsPath = argv[++i];
+      } else if (std::strcmp(argv[i], "--keys") == 0 && i + 1 < argc) {
+        keysPath = argv[++i];
       } else {
         std::cerr << "usage: " << argv[0] << kUsage;
         return 2;
       }
     }
-    return runRead(argv[2], verbose, metricsPath);
+    return runRead(argv[2], verbose, metricsPath, keysPath);
   }
   std::cerr << "usage: " << argv[0] << kUsage;
   return 2;

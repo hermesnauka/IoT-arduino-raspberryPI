@@ -21,7 +21,7 @@ class NodeRegistry {
   };
 
   // Kinds of decode-stage errors attributed to a (claimed) node id.
-  enum class ErrorKind : uint8_t { Crc, Reserved, Range };
+  enum class ErrorKind : uint8_t { Crc, Reserved, Range, Auth };
 
   // Tuning (plan Phase 4 self-test pins these).
   static constexpr uint32_t kBucketCapacity = 100;   // frames of burst
@@ -45,6 +45,7 @@ class NodeRegistry {
     uint32_t crcErrors = 0;
     uint32_t reservedErrors = 0;
     uint32_t rangeErrors = 0;
+    uint32_t authErrors = 0;  // SR-6: forged/missing tag — the spoofing signal
     uint32_t replays = 0;
     uint32_t rateLimited = 0;
     uint32_t quarantineDrops = 0;

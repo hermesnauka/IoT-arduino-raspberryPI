@@ -38,7 +38,14 @@ int main(int argc, char** argv) {
   }
   std::fclose(f);
 
+  // Fixed test keystore for node 1 (same test key as --selftest) so the SR-6
+  // auth gate is inside fuzz coverage too, not just the framing/CRC path.
+  iot::KeyStore ks;
+  ks.present[1] = true;
+  for (int i = 0; i < 16; ++i) ks.keys[1][i] = static_cast<uint8_t>(i);
+
   iot::FrameDecoder dec;
+  dec.setKeyStore(&ks);
   dec.push(data.data(), data.size());
 
   iot::FrameDecoder::Result r{};
