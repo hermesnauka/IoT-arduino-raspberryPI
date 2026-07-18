@@ -64,7 +64,7 @@ Fixed 16-byte frame, little-endian, no padding — mirrored byte-for-byte betwee
 | :--- | :--- | :--- | :--- |
 | 0 | magic | `uint16` | `0xA55A` frame delimiter |
 | 2 | nodeId | `uint8` | 1–255 |
-| 3 | flags | `uint8` | bit0: sensor fault self-report |
+| 3 | flags | `uint8` | bit0: sensor fault self-report; bit1: firmware-version report (see below) |
 | 4 | sequence | `uint32` | monotonic per node, wraps |
 | 8 | temperatureCx100 | `int16` | °C × 100 (fixed-point, no floats on wire) |
 | 10 | humidityPctX100 | `uint16` | %RH × 100 |
@@ -72,6 +72,17 @@ Fixed 16-byte frame, little-endian, no padding — mirrored byte-for-byte betwee
 | 14 | crc16 | `uint16` | CRC-16/CCITT over bytes 0–13 |
 
 `static_assert(sizeof(SensorFrame) == 16)` on both sides is the tripwire.
+
+**Flags-extension frame (Phase 5, stretch — firmware version reporting):** when
+flags bit1 (`kFlagVersionReport`) is set, `temperatureCx100` and
+`humidityPctX100` do not carry a sensor reading — they pack a firmware
+version instead, so no wire-size change is needed. `temperatureCx100`
+(reinterpreted as `uint16`): high byte = major, low byte = minor.
+`humidityPctX100` (reinterpreted as `uint16`): low byte = patch, high byte
+reserved (0). The decoder's SR-1 range gate is skipped for these frames; the
+gateway tracks the version per node without counting it toward `valid` sensor
+readings. The node announces its version once at startup and re-announces
+periodically so a gateway that (re)starts later still learns it.
 
 ---
 
@@ -85,10 +96,12 @@ app01_cpp/
 │       └── sensor_node.ino          # C++ sketch: sample, frame, CRC, transmit
 ├── gateway-rpi/
 │   ├── src/
-│   │   ├── main.cpp                 # --selftest | --read <tty|file|-> [--verbose]
+│   │   ├── main.cpp                 # --selftest | --read <tty|file|-> [--verbose]; SIGUSR1 dumps counters
 │   │   ├── Protocol.h               # wire struct + CRC (mirror of the sketch's copy)
 │   │   ├── FrameDecoder.cpp/.h      # framing, CRC, validation gates (SR-1)
 │   │   └── NodeRegistry.cpp/.h      # sequence/rate/quarantine + aggregates (SR-2/3/4, FR-3)
+│   ├── systemd/
+│   │   └── iot-gateway.service      # Phase 5 packaging: Restart=on-failure, journald, SIGUSR1 dump
 │   └── CMakeLists.txt               # -Wall -Wextra -Wpedantic -Werror -fanalyzer
 ├── tools/
 │   └── frame_simulator.py           # executable protocol spec + conformance scenarios
@@ -114,6 +127,6 @@ app01_cpp/
 
 ## Phase 5: Deployment & Maintenance (Operations)
 
-*   **Gateway packaging:** systemd unit on Raspberry Pi OS; watchdog restart; journald logging with per-node counters dumped on SIGUSR1.
-*   **Firmware updates:** versioned sketch; node reports firmware version in `flags`-extension frame (stretch).
-*   **Monitoring:** per-node error counters exported (stretch: Prometheus text endpoint) — CRC-error spikes are the tamper/EMI signal to alert on.
+*   **Gateway packaging:** systemd unit (`gateway-rpi/systemd/iot-gateway.service`) on Raspberry Pi OS; `Restart=on-failure` as the watchdog-restart mechanism; journald logging (systemd default) with per-node counters dumped via `systemctl kill -s SIGUSR1`.
+*   **Firmware updates:** versioned sketch; node reports firmware version in a `flags`-extension frame (§2.2) once at startup and periodically thereafter.
+*   **Monitoring:** per-node counters (valid/CRC/reserved/range/replay/rate-limited/quarantine/firmware-reports) exported as Prometheus text via `gateway --read <path> --metrics <file>` (`NodeRegistry::writePrometheusText`), written atomically for the node_exporter textfile collector — CRC-error spikes are the tamper/EMI signal to alert on.

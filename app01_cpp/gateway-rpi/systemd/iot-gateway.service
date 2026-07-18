@@ -1,0 +1,42 @@
+# Plan Phase 5 (Deployment & Maintenance) packaging for the app01_cpp gateway.
+#
+# Install:
+#   sudo cp gateway-rpi/build/gateway /usr/local/bin/iot-gateway
+#   sudo cp gateway-rpi/systemd/iot-gateway.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now iot-gateway.service
+#
+# Dump per-node counters on demand (SR-1/SR-2 operator visibility, User Story 2):
+#   sudo systemctl kill -s SIGUSR1 iot-gateway.service
+#   journalctl -u iot-gateway.service -n 50
+#
+# Adjust ExecStart's serial device path for the deployed hardware.
+
+[Unit]
+Description=IoT sensor gateway (app01_cpp) - decodes and validates node telemetry
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/iot-gateway --read /dev/ttyUSB0
+
+# "Watchdog restart": systemd's own process supervision relaunches the
+# gateway on crash or unexpected exit. StartLimitBurst/IntervalSec cap the
+# restart rate so a persistently failing unit doesn't spin forever.
+Restart=on-failure
+RestartSec=2
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# journald captures stdout/stderr automatically for systemd units; explicit
+# here for documentation.
+StandardOutput=journal
+StandardError=journal
+
+# Defense in depth for a service that only needs a serial fd and stdout.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

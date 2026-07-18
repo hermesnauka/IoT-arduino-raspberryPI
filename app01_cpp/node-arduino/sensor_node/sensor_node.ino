@@ -12,6 +12,9 @@
 
 static const uint16_t kMagic = 0xA55A;
 static const uint8_t kFlagSensorFault = 0x01;
+// Flags-extension frame (mirror of gateway Protocol.h kFlagVersionReport):
+// temp/hum fields carry a firmware version instead of a sensor reading.
+static const uint8_t kFlagVersionReport = 0x02;
 
 #pragma pack(push, 1)
 struct SensorFrame {
@@ -45,6 +48,14 @@ static uint16_t crc16Ccitt(const uint8_t *data, uint16_t len) {
 static const uint8_t kNodeId = 1;              // unique per device on the bus
 static const uint32_t kSampleIntervalMs = 5000; // FR-1
 
+// Firmware version, announced via a kFlagVersionReport frame (Plan Phase 5,
+// stretch): once at startup and then every kVersionReportEverySamples
+// readings, so a gateway that (re)starts after the node still learns it.
+static const uint8_t kFirmwareMajor = 1;
+static const uint8_t kFirmwareMinor = 0;
+static const uint8_t kFirmwarePatch = 0;
+static const uint32_t kVersionReportEverySamples = 60; // ~5 min at 5 s/sample
+
 // ---- sensor access ---------------------------------------------------------
 // Replace readSensor() with a real driver (e.g. DHT22 on pin 2) when hardware
 // is attached. Returns false on read failure; the node then retransmits the
@@ -75,7 +86,28 @@ static bool readSensor(Reading &out) {
 
 static uint32_t g_sequence = 0;      // monotonic, wraps at 2^32 (SR-2)
 static uint32_t g_lastSampleMs = 0;
+static uint32_t g_sampleCount = 0;
 static Reading g_lastGood = {2200, 4500};
+
+static void sendVersionFrame() {
+  uint16_t packedTemp = (uint16_t)(((uint16_t)kFirmwareMajor << 8) | kFirmwareMinor);
+
+  SensorFrame frame;
+  frame.magic = kMagic;
+  frame.nodeId = kNodeId;
+  frame.flags = kFlagVersionReport;
+  frame.sequence = g_sequence++;
+  frame.temperatureCx100 = (int16_t)packedTemp;
+  frame.humidityPctX100 = (uint16_t)kFirmwarePatch;
+  frame.reserved = 0;
+
+  uint8_t buf[sizeof(SensorFrame)];
+  memcpy(buf, &frame, sizeof(frame));
+  frame.crc16 = crc16Ccitt(buf, 14);
+  memcpy(buf + 14, &frame.crc16, 2);
+
+  Serial.write(buf, sizeof(buf));
+}
 
 static void sendFrame(const Reading &r, bool fault) {
   SensorFrame frame;
@@ -99,6 +131,7 @@ static void sendFrame(const Reading &r, bool fault) {
 
 void setup() {
   Serial.begin(115200);
+  sendVersionFrame();  // announce firmware version once at startup
 }
 
 void loop() {
@@ -114,4 +147,9 @@ void loop() {
     g_lastGood = r;
   }
   sendFrame(g_lastGood, !ok);
+
+  ++g_sampleCount;
+  if (g_sampleCount % kVersionReportEverySamples == 0) {
+    sendVersionFrame();  // re-announce for gateways that (re)started late
+  }
 }

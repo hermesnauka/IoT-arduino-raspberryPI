@@ -62,9 +62,12 @@ bool FrameDecoder::next(Result& out) {
       out = {Status::BadNodeId, frame};
       return true;
     }
-    if (frame.temperatureCx100 < kTempMinCx100 ||
-        frame.temperatureCx100 > kTempMaxCx100 ||
-        frame.humidityPctX100 > kHumMaxPctX100) {
+    // Version-report frames repurpose these fields for a firmware version,
+    // not a physical reading — SR-1 range gates don't apply to them.
+    if (!(frame.flags & kFlagVersionReport) &&
+        (frame.temperatureCx100 < kTempMinCx100 ||
+         frame.temperatureCx100 > kTempMaxCx100 ||
+         frame.humidityPctX100 > kHumMaxPctX100)) {
       ++stats_.rangeErrors;
       out = {Status::BadRange, frame};
       return true;

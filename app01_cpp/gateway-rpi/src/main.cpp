@@ -2,13 +2,20 @@
 //   gateway --selftest          run the offline security self-test (plan Phase 4)
 //   gateway --read <path|->     decode a byte stream (tty, file, or - for stdin)
 //                               [--verbose] print each accepted reading
+//                               [--metrics <path>] write Prometheus textfile
+//                               metrics after each processed chunk (plan Phase 5)
 // Prints decoder + per-node stats on EOF. Exit code 0 = healthy.
+// SIGUSR1 dumps per-node counters on demand while running.
 
+#include <cstdio>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <istream>
+#include <sstream>
+#include <string>
 
 #include "FrameDecoder.h"
 #include "NodeRegistry.h"
@@ -19,6 +26,14 @@ namespace {
 using iot::FrameDecoder;
 using iot::NodeRegistry;
 using iot::SensorFrame;
+
+// SIGUSR1 dumps per-node counters to stdout on demand (Plan Phase 5:
+// journald captures stdout under systemd, so `systemctl kill -s SIGUSR1
+// <unit>` + `journalctl` is the operator's counter-dump workflow). The
+// handler only sets a flag; the actual print happens back in the read loop,
+// since std::cout is not async-signal-safe.
+volatile std::sig_atomic_t g_dumpRequested = 0;
+void handleSigUsr1(int /*signum*/) { g_dumpRequested = 1; }
 
 // ---------------------------------------------------------------------------
 // Frame construction helper (used by self-test only; the real producer is the
@@ -37,6 +52,14 @@ SensorFrame makeFrame(uint8_t nodeId, uint32_t seq, int16_t tempCx100,
   std::memcpy(raw, &f, iot::kFrameSize);
   f.crc16 = iot::crc16Ccitt(raw, iot::kCrcCoverage);
   return f;
+}
+
+// Builds a flags-extension version-report frame (Protocol.h kFlagVersionReport).
+SensorFrame makeVersionFrame(uint8_t nodeId, uint32_t seq, uint8_t major, uint8_t minor,
+                             uint8_t patch) {
+  uint16_t packedTemp = static_cast<uint16_t>((static_cast<uint16_t>(major) << 8) | minor);
+  return makeFrame(nodeId, seq, static_cast<int16_t>(packedTemp), patch,
+                   iot::kFlagVersionReport, 0);
 }
 
 void pushFrame(FrameDecoder& dec, const SensorFrame& f) {
@@ -216,6 +239,39 @@ void testAggregates() {
   CHECK(a.humAvgPctX100 == 4500);
 }
 
+void testVersionReportFrame() {
+  FrameDecoder dec;
+  NodeRegistry reg;
+  // major=200 packs a temp field well outside the sensor range: proves the
+  // range gate is actually skipped for version frames, not coincidentally passing.
+  pushFrame(dec, makeVersionFrame(1, 1, 200, 1, 5));
+  FrameDecoder::Result r{};
+  CHECK(dec.next(r));
+  CHECK(r.status == FrameDecoder::Status::Ok);
+  bool q = false;
+  CHECK(reg.accept(r.frame, 0, q) == NodeRegistry::Accept::Accepted);
+  const NodeRegistry::NodeState& n = reg.state(1);
+  CHECK(n.haveFirmwareVersion);
+  CHECK(n.firmwareMajor == 200);
+  CHECK(n.firmwareMinor == 1);
+  CHECK(n.firmwarePatch == 5);
+  CHECK(n.versionReports == 1);
+  CHECK(n.valid == 0);  // not counted as a sensor reading
+}
+
+void testPrometheusExport() {
+  NodeRegistry reg;
+  bool q = false;
+  CHECK(reg.accept(makeFrame(1, 1, 2250, 4500), 0, q) == NodeRegistry::Accept::Accepted);
+  CHECK(reg.accept(makeVersionFrame(1, 2, 1, 2, 3), 100, q) == NodeRegistry::Accept::Accepted);
+  std::ostringstream oss;
+  reg.writePrometheusText(oss);
+  std::string text = oss.str();
+  CHECK(text.find("iot_gateway_node_valid_total{node=\"1\"} 1") != std::string::npos);
+  CHECK(text.find("iot_gateway_node_firmware_reports_total{node=\"1\"} 1") != std::string::npos);
+  CHECK(text.find("# TYPE iot_gateway_node_quarantined gauge") != std::string::npos);
+}
+
 void testFuzzDecoderNeverCrashes() {
   // Deterministic LCG byte storm: the decoder must stay bounded and sane.
   FrameDecoder dec;
@@ -244,6 +300,15 @@ void testFuzzDecoderNeverCrashes() {
   CHECK(s.resyncBytes + s.bytesDropped <= s.bytesIn);
 }
 
+void testSigUsr1SetsDumpFlag() {
+  g_dumpRequested = 0;
+  std::signal(SIGUSR1, handleSigUsr1);
+  std::raise(SIGUSR1);
+  CHECK(g_dumpRequested == 1);
+  g_dumpRequested = 0;
+  std::signal(SIGUSR1, SIG_DFL);
+}
+
 int runSelfTest() {
   testWireContract();
   testValidFrameAccepted();
@@ -256,7 +321,10 @@ int runSelfTest() {
   testRateLimit();
   testQuarantineIsolatesNode();
   testAggregates();
+  testVersionReportFrame();
+  testPrometheusExport();
   testFuzzDecoderNeverCrashes();
+  testSigUsr1SetsDumpFlag();
   if (g_failures == 0) {
     std::cout << "selftest: all checks passed\n";
     return 0;
@@ -266,8 +334,31 @@ int runSelfTest() {
 }
 
 // ---------------------------------------------------------------------------
+// Prometheus textfile-collector export (plan Phase 5, stretch monitoring):
+// write-then-rename so a concurrent scrape/collector never reads a partial
+// file (the standard node_exporter textfile-collector contract).
+void writeMetricsAtomic(const char* path, const NodeRegistry& reg) {
+  char tmpPath[512];
+  int n = std::snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
+  if (n < 0 || static_cast<std::size_t>(n) >= sizeof(tmpPath)) {
+    std::cerr << "warning: metrics path too long, skipping export\n";
+    return;
+  }
+  std::ofstream out(tmpPath, std::ios::trunc);
+  if (!out) {
+    std::cerr << "warning: cannot write metrics file " << tmpPath << "\n";
+    return;
+  }
+  reg.writePrometheusText(out);
+  out.close();
+  if (std::rename(tmpPath, path) != 0) {
+    std::cerr << "warning: cannot rename metrics file to " << path << "\n";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Stream mode
-int runRead(const char* path, bool verbose) {
+int runRead(const char* path, bool verbose, const char* metricsPath) {
   std::ifstream file;
   std::istream* in = &std::cin;
   if (std::strcmp(path, "-") != 0) {
@@ -282,12 +373,20 @@ int runRead(const char* path, bool verbose) {
   FrameDecoder dec;
   NodeRegistry reg;
   uint32_t syntheticMs = 0;  // file replay has no wall clock; one tick per chunk
+  std::signal(SIGUSR1, handleSigUsr1);
 
   uint8_t buf[512];
   while (in->read(reinterpret_cast<char*>(buf), sizeof(buf)) || in->gcount() > 0) {
     std::size_t got = static_cast<std::size_t>(in->gcount());
     dec.push(buf, got);
     ++syntheticMs;
+
+    if (g_dumpRequested) {
+      g_dumpRequested = 0;
+      std::cout << "[SIGUSR1] per-node counters dump:\n";
+      reg.printStats(std::cout);
+      std::cout.flush();
+    }
 
     FrameDecoder::Result r{};
     while (dec.next(r)) {
@@ -296,12 +395,21 @@ int runRead(const char* path, bool verbose) {
         case FrameDecoder::Status::Ok: {
           NodeRegistry::Accept verdict = reg.accept(r.frame, syntheticMs, alert);
           if (verdict == NodeRegistry::Accept::Accepted && verbose) {
-            std::cout << "node " << static_cast<unsigned>(r.frame.nodeId)
-                      << " seq=" << r.frame.sequence
-                      << " temp=" << r.frame.temperatureCx100 / 100.0
-                      << "C hum=" << r.frame.humidityPctX100 / 100.0 << "%"
-                      << (r.frame.flags & iot::kFlagSensorFault ? " [FAULT]" : "")
-                      << "\n";
+            if (r.frame.flags & iot::kFlagVersionReport) {
+              const NodeRegistry::NodeState& n = reg.state(r.frame.nodeId);
+              std::cout << "node " << static_cast<unsigned>(r.frame.nodeId)
+                        << " seq=" << r.frame.sequence << " firmware="
+                        << static_cast<unsigned>(n.firmwareMajor) << "."
+                        << static_cast<unsigned>(n.firmwareMinor) << "."
+                        << static_cast<unsigned>(n.firmwarePatch) << "\n";
+            } else {
+              std::cout << "node " << static_cast<unsigned>(r.frame.nodeId)
+                        << " seq=" << r.frame.sequence
+                        << " temp=" << r.frame.temperatureCx100 / 100.0
+                        << "C hum=" << r.frame.humidityPctX100 / 100.0 << "%"
+                        << (r.frame.flags & iot::kFlagSensorFault ? " [FAULT]" : "")
+                        << "\n";
+            }
           }
           break;
         }
@@ -326,6 +434,10 @@ int runRead(const char* path, bool verbose) {
                   << ": quarantined after error streak\n";
       }
     }
+
+    if (metricsPath) {
+      writeMetricsAtomic(metricsPath, reg);
+    }
   }
 
   const FrameDecoder::Stats& s = dec.stats();
@@ -340,14 +452,30 @@ int runRead(const char* path, bool verbose) {
 
 }  // namespace
 
+namespace {
+const char kUsage[] =
+    " --selftest | --read <path|-> [--verbose] [--metrics <path>]\n";
+}
+
 int main(int argc, char** argv) {
   if (argc >= 2 && std::strcmp(argv[1], "--selftest") == 0) {
     return runSelfTest();
   }
   if (argc >= 3 && std::strcmp(argv[1], "--read") == 0) {
-    bool verbose = (argc >= 4 && std::strcmp(argv[3], "--verbose") == 0);
-    return runRead(argv[2], verbose);
+    bool verbose = false;
+    const char* metricsPath = nullptr;
+    for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--verbose") == 0) {
+        verbose = true;
+      } else if (std::strcmp(argv[i], "--metrics") == 0 && i + 1 < argc) {
+        metricsPath = argv[++i];
+      } else {
+        std::cerr << "usage: " << argv[0] << kUsage;
+        return 2;
+      }
+    }
+    return runRead(argv[2], verbose, metricsPath);
   }
-  std::cerr << "usage: " << argv[0] << " --selftest | --read <path|-> [--verbose]\n";
+  std::cerr << "usage: " << argv[0] << kUsage;
   return 2;
 }

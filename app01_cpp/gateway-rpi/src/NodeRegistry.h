@@ -49,9 +49,16 @@ class NodeRegistry {
     uint32_t rateLimited = 0;
     uint32_t quarantineDrops = 0;
     uint32_t quarantineEvents = 0;
+    uint32_t versionReports = 0;
     uint8_t lastFlags = 0;
     int16_t lastTempCx100 = 0;
     uint16_t lastHumPctX100 = 0;
+    // Firmware version (Plan Phase 5, stretch), from the latest version-report
+    // frame (Protocol.h kFlagVersionReport). Not a sensor reading.
+    bool haveFirmwareVersion = false;
+    uint8_t firmwareMajor = 0;
+    uint8_t firmwareMinor = 0;
+    uint8_t firmwarePatch = 0;
     // Token bucket, in milli-tokens (integer math only).
     uint32_t tokensMilli = kBucketCapacity * 1000;
     uint32_t lastRefillMs = 0;
@@ -84,6 +91,11 @@ class NodeRegistry {
   Aggregate aggregate(uint8_t nodeId) const;
 
   void printStats(std::ostream& os) const;
+
+  // Prometheus text-exposition format (Plan Phase 5, stretch monitoring).
+  // Intended for the node_exporter textfile collector: the caller writes
+  // this to a file, not a live HTTP endpoint (see main.cpp --metrics).
+  void writePrometheusText(std::ostream& os) const;
 
  private:
   void noteError(NodeState& n, uint32_t nowMs, bool& quarantineTriggered);

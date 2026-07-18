@@ -19,6 +19,7 @@ import sys
 MAGIC = 0xA55A
 FRAME_FMT = "<HBBIhHH"  # magic, nodeId, flags, sequence, tempCx100, humX100, reserved
 FRAME_SIZE = 16
+FLAG_VERSION_REPORT = 0x02  # Protocol.h kFlagVersionReport (Plan Phase 5, stretch)
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -45,9 +46,21 @@ def frame(node_id, seq, temp_c=22.5, hum_pct=45.0, flags=0, reserved=0, corrupt=
     return out
 
 
+def version_frame(node_id, seq, major=1, minor=0, patch=0):
+    """Flags-extension frame: temp/hum fields carry a firmware version."""
+    packed_temp = ((major & 0xFF) << 8) | (minor & 0xFF)
+    temp_raw = struct.unpack("<h", struct.pack("<H", packed_temp))[0]
+    body = struct.pack(FRAME_FMT, MAGIC, node_id, FLAG_VERSION_REPORT, seq,
+                       temp_raw, patch & 0xFF, 0)
+    crc = crc16_ccitt(body)
+    out = body + struct.pack("<H", crc)
+    assert len(out) == FRAME_SIZE
+    return out
+
+
 NODE_RE = re.compile(
     r"\[node (\d+)\] valid=(\d+) crc=(\d+) reserved=(\d+) range=(\d+) "
-    r"replay=(\d+) rate=(\d+) qdrop=(\d+) quarantines=(\d+) lastSeq=(\d+)")
+    r"replay=(\d+) rate=(\d+) qdrop=(\d+) quarantines=(\d+) fw=(\d+) lastSeq=(\d+)")
 DEC_RE = re.compile(
     r"\[decoder\] bytesIn=(\d+) framesOk=(\d+) crcErrors=(\d+) resyncBytes=(\d+)")
 
@@ -63,7 +76,7 @@ def run_gateway(gateway, payload):
         vals = list(map(int, m.groups()))
         nodes[vals[0]] = dict(zip(
             ["valid", "crc", "reserved", "range", "replay", "rate", "qdrop",
-             "quarantines", "lastSeq"], vals[1:]))
+             "quarantines", "fw", "lastSeq"], vals[1:]))
     dec = DEC_RE.search(out)
     decoder = dict(zip(["bytesIn", "framesOk", "crcErrors", "resyncBytes"],
                        map(int, dec.groups()))) if dec else {}
@@ -164,6 +177,39 @@ def scenario_flood(gw):
           "exactly one quarantine alert (no log storm)")
 
 
+def scenario_firmware_version(gw):
+    print("scenario: firmware version report (Plan Phase 5, stretch)")
+    # major=200 packs a temp field well outside the sensor range, proving the
+    # range gate is actually skipped for version frames, not just coincidentally passing.
+    payload = version_frame(1, 1, major=200, minor=1, patch=5) + frame(1, 2) + frame(1, 3)
+    nodes, dec, _ = run_gateway(gw, payload)
+    n1 = nodes.get(1, {})
+    check("firmware", n1.get("valid") == 2, "version frame not counted as a sensor reading")
+    check("firmware", n1.get("fw") == 1, "version frame counted separately")
+    check("firmware", n1.get("range") == 0, "version frame's packed fields don't trip SR-1 range gate")
+    check("firmware", dec["framesOk"] == 3, "all three frames decode Ok")
+
+
+def scenario_metrics_export(gw):
+    print("scenario: Prometheus metrics export (Plan Phase 5, stretch)")
+    import tempfile
+    import os as _os
+    payload = frame(1, 1) + frame(1, 2) + frame(1, 3) + frame(1, 4, corrupt=True)
+    with tempfile.TemporaryDirectory() as d:
+        path = _os.path.join(d, "gateway.prom")
+        proc = subprocess.run([gw, "--read", "-", "--metrics", path], input=payload,
+                              capture_output=True, timeout=30)
+        if proc.returncode != 0:
+            raise AssertionError(f"gateway exited {proc.returncode}: {proc.stderr.decode()}")
+        text = open(path).read()
+    check("metrics", 'iot_gateway_node_valid_total{node="1"} 3' in text,
+          "valid counter exported")
+    check("metrics", 'iot_gateway_node_crc_errors_total{node="1"} 1' in text,
+          "crc error counter exported")
+    check("metrics", "# TYPE iot_gateway_node_quarantined gauge" in text,
+          "gauge metric type declared")
+
+
 def scenario_garbage_flood(gw):
     print("scenario: 64 KiB random flood (fuzz — decoder must survive)")
     rng = random.Random(0xC0FFEE)
@@ -179,7 +225,8 @@ def main():
     gw = ap.parse_args().gateway
     for scenario in (scenario_valid_stream, scenario_multi_node, scenario_bad_crc,
                      scenario_out_of_range, scenario_reserved, scenario_replay,
-                     scenario_garbage_resync, scenario_flood, scenario_garbage_flood):
+                     scenario_garbage_resync, scenario_flood, scenario_garbage_flood,
+                     scenario_firmware_version, scenario_metrics_export):
         scenario(gw)
     if FAILURES:
         print(f"\n{len(FAILURES)} scenario check(s) FAILED:")

@@ -12,6 +12,13 @@ constexpr uint16_t kMagic = 0xA55A;
 constexpr uint8_t kMagicByte0 = 0x5A;  // little-endian byte order on the wire
 constexpr uint8_t kMagicByte1 = 0xA5;
 constexpr uint8_t kFlagSensorFault = 0x01;
+// Flags-extension frame (Plan Phase 5, stretch): when set, temperatureCx100
+// and humidityPctX100 do not carry a sensor reading — they pack a firmware
+// version instead. This keeps the frame byte-identical (still 16 bytes) while
+// letting a node announce itself without a protocol version bump.
+//   temperatureCx100 (reinterpreted as uint16): high byte = major, low byte = minor
+//   humidityPctX100 (reinterpreted as uint16):   low byte = patch, high byte reserved (0)
+constexpr uint8_t kFlagVersionReport = 0x02;
 constexpr std::size_t kFrameSize = 16;
 constexpr std::size_t kCrcCoverage = 14;  // bytes 0–13
 
