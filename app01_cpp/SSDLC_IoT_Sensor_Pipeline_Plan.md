@@ -21,6 +21,7 @@
 *   **SR-3 (Rate Limiting):** The gateway throttles per-node frame rates (a stuck or malicious node cannot starve the loop or flood downstream consumers).
 *   **SR-4 (Fail-Safe Degradation):** Sensor faults (NaN, out-of-range, CRC storms) are quarantined per node; other nodes continue to be served.
 *   **SR-5 (No Dynamic Allocation on Node):** The Arduino firmware uses only static buffers — no heap fragmentation on a device that runs for months.
+*   **SR-6 (Frame Authenticity — stretch):** Every frame carries a SipHash-2-4 tag keyed with a 128-bit per-node pre-shared key; the gateway drops frames whose tag does not verify (constant-time compare) and counts them toward quarantine. A rogue device without the key cannot impersonate a node ID even with a valid CRC.
 
 ---
 
@@ -51,14 +52,14 @@
 
 | Threat Category | Project Threat | Mitigation Strategy |
 | :--- | :--- | :--- |
-| **Spoofing** | A rogue device on the bus impersonating a legitimate node ID. | Per-node sequence tracking; (stretch) HMAC over the frame with a per-node key. |
+| **Spoofing** | A rogue device on the bus impersonating a legitimate node ID. | Per-node sequence tracking; (stretch, SR-6) per-node keyed SipHash-2-4 tag over the frame — see §2.3. |
 | **Tampering** | Bit flips or injected bytes corrupting frames in transit. | Magic-byte framing + CRC-16 over the payload; resynchronization scan on framing errors. |
 | **Information Disclosure** | Serial sniffing of telemetry. | Telemetry is low-sensitivity; document the boundary. (Stretch: encrypt gateway→cloud leg with TLS/MQTTs.) |
 | **Denial of Service** | A stuck node streaming garbage at full baud rate. | Per-node rate limiting (SR-3) and quarantine (SR-4); bounded read loop budget per tick. |
 | **Elevation of Privilege** | Malformed frame exploiting a gateway parsing bug (buffer overflow). | Fixed-size frame, explicit bounds checks, `-Werror -fanalyzer` SAST gate, fuzz test of the decoder. |
 
 ### 2.2 Wire Protocol (shared contract)
-Fixed 16-byte frame, little-endian, no padding — mirrored byte-for-byte between the Arduino firmware and the gateway decoder (same discipline as a game-server input packet):
+Fixed 24-byte frame, little-endian, no padding — mirrored byte-for-byte between the Arduino firmware and the gateway decoder (same discipline as a game-server input packet):
 
 | Offset | Field | Type | Notes |
 | :--- | :--- | :--- | :--- |
@@ -70,8 +71,41 @@ Fixed 16-byte frame, little-endian, no padding — mirrored byte-for-byte betwee
 | 10 | humidityPctX100 | `uint16` | %RH × 100 |
 | 12 | reserved | `uint16` | must be 0 |
 | 14 | crc16 | `uint16` | CRC-16/CCITT over bytes 0–13 |
+| 16 | authTag | `uint64` | SipHash-2-4 over bytes 0–13, per-node 128-bit key (§2.3, SR-6) |
 
-`static_assert(sizeof(SensorFrame) == 16)` on both sides is the tripwire.
+`static_assert(sizeof(SensorFrame) == 24)` on both sides is the tripwire.
+Validation order at the gateway: size → CRC (cheap, catches EMI/bit rot) →
+authTag (authenticity) → ranges → sequence. The sequence number sits inside
+the MAC coverage, so replay protection and authenticity are bound together.
+
+### 2.3 Frame Authentication & Key Management (SR-6, stretch)
+
+*   **Algorithm:** SipHash-2-4 (Aumasson–Bernstein), 128-bit key, 64-bit tag —
+    designed as a fast keyed PRF for short inputs on constrained hardware; a
+    few hundred bytes of code and microseconds per frame on the ATmega328P,
+    versus kilobytes of flash for HMAC-SHA256 with no security gain at this
+    threat level (online-only forgery on a rate-limited, quarantining link).
+*   **Coverage:** bytes 0–13 (same span as the CRC): magic, nodeId, flags,
+    sequence, payload, reserved. The CRC itself is derived from the same bytes
+    so including it would add nothing.
+*   **Keys:** one 128-bit pre-shared key per node.
+    *   *Gateway:* loaded at startup from a key file (`--keys <path>`, one
+        `nodeId:32-hex-chars` per line, recommend mode 0600); never compiled
+        in. A frame from a node with no key entry is dropped and counted.
+    *   *Node:* key resides in the sketch as a `PROGMEM` constant — an
+        accepted dev-grade limitation, documented here; production would move
+        it to EEPROM or a secure element. Key never leaves the node.
+    *   *Selftest/simulator:* fixed test keys baked into `--selftest` and
+        `frame_simulator.py` (test-only, clearly labeled).
+*   **Verification is constant-time:** tag comparison uses a branch-free
+    accumulate-XOR loop, not `memcmp`, to avoid a timing oracle.
+*   **Failure handling:** bad/missing tag → drop, increment per-node
+    `authErrors`, counts toward quarantine (SR-4) and is exported to
+    Prometheus. An auth-error spike is the spoofing signal to alert on.
+*   **Known-answer tripwire:** SipHash-2-4 reference test vectors (from the
+    reference implementation's `vectors_sip64`) asserted in `--selftest` on
+    the C++ side and in `frame_simulator.py` on the Python side, mirroring the
+    CRC `0x29B1` tripwire.
 
 **Flags-extension frame (Phase 5, stretch — firmware version reporting):** when
 flags bit1 (`kFlagVersionReport`) is set, `temperatureCx100` and
@@ -100,6 +134,7 @@ app01_cpp/
 │   │   ├── Protocol.h               # wire struct + CRC (mirror of the sketch's copy)
 │   │   ├── FrameDecoder.cpp/.h      # framing, CRC, validation gates (SR-1)
 │   │   └── NodeRegistry.cpp/.h      # sequence/rate/quarantine + aggregates (SR-2/3/4, FR-3)
+│   │   └── SipHash.h                # header-only SipHash-2-4 (SR-6), shared style with crc16Ccitt
 │   ├── systemd/
 │   │   └── iot-gateway.service      # Phase 5 packaging: Restart=on-failure, journald, SIGUSR1 dump
 │   ├── fuzz/
@@ -122,7 +157,7 @@ app01_cpp/
 ## Phase 4: Verification & Testing (Security Assessment)
 
 *   **SAST:** GCC `-fanalyzer` + `-Wall -Wextra -Wpedantic -Werror` baked into CMake (build fails on any finding). `arduino-cli compile` (or PlatformIO check) for the sketch if available.
-*   **Offline self-test:** `gateway --selftest` asserts: valid frame accepted; bad CRC dropped; out-of-range temperature dropped; replayed sequence ignored; reserved-nonzero dropped; quarantine engages after N consecutive errors and other nodes stay live.
+*   **Offline self-test:** `gateway --selftest` asserts: valid frame accepted; bad CRC dropped; out-of-range temperature dropped; replayed sequence ignored; reserved-nonzero dropped; quarantine engages after N consecutive errors and other nodes stay live; (SR-6) SipHash known-answer vectors pass, valid tag accepted, forged tag dropped, tampered-frame-with-recomputed-CRC dropped by tag, unknown-node frame dropped.
 *   **Protocol conformance (Python simulator):** feeds the gateway valid frames, bit-flipped frames, truncated frames, interleaved multi-node streams, and a full-baud garbage flood; asserts counters and outputs.
 *   **Fuzzing:** decoder entry point fuzzed with random byte streams. Simple Python random fuzz (`frame_simulator.py`'s garbage-flood scenario) plus a deterministic in-process fuzz in `--selftest`. Stretch: coverage-guided AFL++ via `gateway-rpi/fuzz/fuzz_decoder.cpp`, an opt-in `BUILD_FUZZER` CMake target (off by default, so it never affects the required verify workflow) — the decoder must never crash or over-read.
 
@@ -132,4 +167,4 @@ app01_cpp/
 
 *   **Gateway packaging:** systemd unit (`gateway-rpi/systemd/iot-gateway.service`) on Raspberry Pi OS; `Restart=on-failure` as the watchdog-restart mechanism; journald logging (systemd default) with per-node counters dumped via `systemctl kill -s SIGUSR1`.
 *   **Firmware updates:** versioned sketch; node reports firmware version in a `flags`-extension frame (§2.2) once at startup and periodically thereafter.
-*   **Monitoring:** per-node counters (valid/CRC/reserved/range/replay/rate-limited/quarantine/firmware-reports) exported as Prometheus text via `gateway --read <path> --metrics <file>` (`NodeRegistry::writePrometheusText`), written atomically for the node_exporter textfile collector — CRC-error spikes are the tamper/EMI signal to alert on.
+*   **Monitoring:** per-node counters (valid/CRC/auth/reserved/range/replay/rate-limited/quarantine/firmware-reports) exported as Prometheus text via `gateway --read <path> --metrics <file>` (`NodeRegistry::writePrometheusText`), written atomically for the node_exporter textfile collector — CRC-error spikes are the tamper/EMI signal to alert on.
