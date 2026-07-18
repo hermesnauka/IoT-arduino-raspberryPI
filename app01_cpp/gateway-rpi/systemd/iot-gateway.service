@@ -15,28 +15,68 @@
 [Unit]
 Description=IoT sensor gateway (app01_cpp) - decodes and validates node telemetry
 After=multi-user.target
+# Cap the restart rate so a persistently failing unit doesn't spin forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/iot-gateway --read /dev/ttyUSB0
+ExecStart=/usr/local/bin/iot-gateway --read /dev/ttyUSB0 --aggregate 12
+# Full deployment (FR-3 publishing + Phase 5 monitoring + SR-6 auth):
+#   ExecStart=/usr/local/bin/iot-gateway --read /dev/ttyUSB0 --aggregate 12 \
+#       --metrics /var/lib/iot-gateway/gateway.prom \
+#       --keys ${CREDENTIALS_DIRECTORY}/keys
+#   StateDirectory=iot-gateway
+#   LoadCredential=keys:/etc/iot-gateway/keys
+# StateDirectory gives the sandboxed service its writable metrics directory;
+# LoadCredential hands the root-owned 0600 key file to the DynamicUser
+# process without loosening the key file's permissions.
 
 # "Watchdog restart": systemd's own process supervision relaunches the
-# gateway on crash or unexpected exit. StartLimitBurst/IntervalSec cap the
-# restart rate so a persistently failing unit doesn't spin forever.
+# gateway on crash or unexpected exit (rate-capped in [Unit]).
 Restart=on-failure
 RestartSec=2
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # journald captures stdout/stderr automatically for systemd units; explicit
 # here for documentation.
 StandardOutput=journal
 StandardError=journal
 
-# Defense in depth for a service that only needs a serial fd and stdout.
+# Least privilege: no root. A transient unprivileged user, in the dialout
+# group only for the serial device (Raspberry Pi OS puts /dev/ttyUSB* and
+# /dev/ttyAMA* in group dialout).
+DynamicUser=true
+SupplementaryGroups=dialout
+
+# Defense in depth (STRIDE: Elevation of Privilege): the process parses
+# hostile bytes, so assume compromise and give it nothing — only the serial
+# character device, no network, no capabilities, a native-arch service
+# syscall allowlist, and read-only views of everything it doesn't own.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+ProtectHome=true
+DevicePolicy=closed
+DeviceAllow=char-ttyUSB rw
+DeviceAllow=char-ttyAMA rw
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
