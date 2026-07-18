@@ -9,14 +9,18 @@
 // Prints decoder + per-node stats on EOF. Exit code 0 = healthy.
 // SIGUSR1 dumps per-node counters on demand while running.
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdio>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <iostream>
-#include <istream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -473,18 +477,20 @@ void writeMetricsAtomic(const char* path, const NodeRegistry& reg) {
 }
 
 // ---------------------------------------------------------------------------
-// Stream mode
+// Stream mode. Reads the raw fd with POSIX read(), not iostreams: on a tty a
+// read must return as soon as any bytes arrive — istream::read would block
+// until a full buffer accumulated (~107 s of frames at one node's 5 s
+// cadence) and discard the partial tail on hangup.
 int runRead(const char* path, bool verbose, const char* metricsPath,
             const char* keysPath, uint32_t aggregateEvery) {
-  std::ifstream file;
-  std::istream* in = &std::cin;
+  int fd = 0;  // "-" = stdin
   if (std::strcmp(path, "-") != 0) {
-    file.open(path, std::ios::binary);
-    if (!file) {
-      std::cerr << "error: cannot open " << path << "\n";
+    fd = ::open(path, O_RDONLY | O_NOCTTY);
+    if (fd < 0) {
+      std::cerr << "error: cannot open " << path << ": " << std::strerror(errno)
+                << "\n";
       return 2;
     }
-    in = &file;
   }
 
   FrameDecoder dec;
@@ -498,17 +504,26 @@ int runRead(const char* path, bool verbose, const char* metricsPath,
     }
     dec.setKeyStore(&keys);
   }
-  uint32_t syntheticMs = 0;  // file replay has no wall clock; one tick per chunk
+  // Time source for the SR-2/3/4 gates (quarantine duration, token refill).
+  // Live tty: CLOCK_MONOTONIC, so a 30 s quarantine is 30 real seconds. File
+  // or pipe replay: one synthetic tick per chunk, so conformance tests stay
+  // deterministic regardless of host speed. uint32 ms wraps at ~49 days; the
+  // registry only uses unsigned deltas, so wrap is safe.
+  const bool liveClock = isatty(fd) == 1;
+  uint32_t nowMs = 0;
   // FR-3 publish interval, counted in accepted sensor readings rather than
   // wall time so replayed byte files and PTY streams behave identically.
   uint32_t acceptedSincePublish = 0;
-  std::signal(SIGUSR1, handleSigUsr1);
+  // sigaction without SA_RESTART: SIGUSR1 must interrupt a blocked read()
+  // (EINTR) so a counter dump does not wait for the next frame to arrive.
+  struct sigaction sa = {};
+  sa.sa_handler = handleSigUsr1;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGUSR1, &sa, nullptr);
 
   uint8_t buf[512];
-  while (in->read(reinterpret_cast<char*>(buf), sizeof(buf)) || in->gcount() > 0) {
-    std::size_t got = static_cast<std::size_t>(in->gcount());
-    dec.push(buf, got);
-    ++syntheticMs;
+  for (;;) {
+    ssize_t got = ::read(fd, buf, sizeof(buf));
 
     if (g_dumpRequested) {
       g_dumpRequested = 0;
@@ -517,12 +532,30 @@ int runRead(const char* path, bool verbose, const char* metricsPath,
       std::cout.flush();
     }
 
+    if (got < 0) {
+      if (errno == EINTR) continue;  // signal during blocked read; dump done above
+      if (errno != EIO) {            // EIO = tty hangup, the normal serial EOF
+        std::cerr << "error: read " << path << ": " << std::strerror(errno) << "\n";
+      }
+      break;
+    }
+    if (got == 0) break;  // EOF (file replay or closed pipe)
+    dec.push(buf, static_cast<std::size_t>(got));
+    if (liveClock) {
+      struct timespec ts = {};
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      nowMs = static_cast<uint32_t>(static_cast<uint64_t>(ts.tv_sec) * 1000u +
+                                    static_cast<uint64_t>(ts.tv_nsec) / 1000000u);
+    } else {
+      ++nowMs;
+    }
+
     FrameDecoder::Result r{};
     while (dec.next(r)) {
       bool alert = false;
       switch (r.status) {
         case FrameDecoder::Status::Ok: {
-          NodeRegistry::Accept verdict = reg.accept(r.frame, syntheticMs, alert);
+          NodeRegistry::Accept verdict = reg.accept(r.frame, nowMs, alert);
           if (verdict == NodeRegistry::Accept::Accepted && aggregateEvery > 0 &&
               !(r.frame.flags & iot::kFlagVersionReport)) {
             // Version reports carry no sensor payload (plan §2.2), so they
@@ -554,22 +587,22 @@ int runRead(const char* path, bool verbose, const char* metricsPath,
         }
         case FrameDecoder::Status::BadCrc:
           reg.recordDecodeError(r.frame.nodeId, NodeRegistry::ErrorKind::Crc,
-                                syntheticMs, alert);
+                                nowMs, alert);
           break;
         case FrameDecoder::Status::BadReserved:
         case FrameDecoder::Status::BadNodeId:
           reg.recordDecodeError(r.frame.nodeId, NodeRegistry::ErrorKind::Reserved,
-                                syntheticMs, alert);
+                                nowMs, alert);
           break;
         case FrameDecoder::Status::BadAuth:
           reg.recordDecodeError(r.frame.nodeId, NodeRegistry::ErrorKind::Auth,
-                                syntheticMs, alert);
+                                nowMs, alert);
           break;
         case FrameDecoder::Status::BadRange:
           std::cerr << "ALERT node " << static_cast<unsigned>(r.frame.nodeId)
                     << ": out-of-range reading dropped (possible tamper)\n";
           reg.recordDecodeError(r.frame.nodeId, NodeRegistry::ErrorKind::Range,
-                                syntheticMs, alert);
+                                nowMs, alert);
           break;
       }
       if (alert) {
@@ -582,6 +615,8 @@ int runRead(const char* path, bool verbose, const char* metricsPath,
       writeMetricsAtomic(metricsPath, reg);
     }
   }
+
+  if (fd != 0) ::close(fd);
 
   const FrameDecoder::Stats& s = dec.stats();
   std::cout << "[decoder] bytesIn=" << s.bytesIn << " framesOk=" << s.framesOk

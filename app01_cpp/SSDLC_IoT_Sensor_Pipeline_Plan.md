@@ -161,6 +161,7 @@ app01_cpp/
 *   **Resync on garbage:** on framing failure, slide one byte and rescan for magic — a hostile byte stream may embed fake magics, so CRC remains the authority.
 *   **Testability without hardware:** the gateway reads from any file descriptor — a recorded byte file or a PTY fed by a Python simulator stands in for the Arduino during CI. The Python frame simulator plays the same role as the UDP test clients in the shooter project: an executable specification of the protocol.
 *   **FR-3 publish leg:** `--aggregate <n>` publishes per-node min/max/avg over the rolling window every *n* accepted sensor readings. The interval is counted in readings rather than wall time so byte-file replays and live serial behave identically; version-report frames carry no sensor payload and never advance it.
+*   **Injected time, two sources:** `NodeRegistry` takes milliseconds as a parameter (tests control the clock). Stream mode feeds it `CLOCK_MONOTONIC` when the input is a real tty (`isatty`) — so quarantine durations and token-bucket refill (SR-3/4) run on wall time in deployment — but one synthetic tick per read chunk on file/pipe replay, keeping conformance tests deterministic. Reads use POSIX `read()` directly (a tty must deliver bytes as they arrive, and SIGUSR1 must interrupt an idle blocked read via `EINTR`).
 
 ---
 

@@ -241,6 +241,79 @@ def scenario_firmware_version(gw):
     check("firmware", dec["framesOk"] == 3, "all three frames decode Ok")
 
 
+def scenario_pty_live(gw):
+    print("scenario: live PTY end-to-end (workflow step 4)")
+    # The deployment mode is --read <serial tty>, but every other scenario
+    # pipes stdin. Here a PTY stands in for the Arduino's UART: the simulator
+    # writes frames to the master side while the gateway reads the slave
+    # device by path, exactly as it would read /dev/ttyUSB0.
+    import os as _os
+    import pty as _pty
+    import time as _time
+    import tty as _tty
+    master, slave = _pty.openpty()
+    # Raw mode, as a real serial port would be configured: a cooked line
+    # discipline would translate CR/NL and eat VINTR/VEOF bytes.
+    _tty.setraw(slave)
+    proc = subprocess.Popen([gw, "--read", _os.ttyname(slave), "--verbose",
+                             "--aggregate", "3"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        _time.sleep(0.1)  # let the gateway open the slave before data flows
+        for s in range(1, 6):
+            _os.write(master, frame(1, s, 20 + s * 0.1))
+            _time.sleep(0.02)
+        # temp 33.38C -> 0x0D0A, hum 7.72% -> 0x0304: the wire bytes contain
+        # NL, CR, VINTR and VEOF — only a truly binary-safe tty path survives.
+        _os.write(master, frame(1, 6, temp_c=33.38, hum_pct=7.72))
+        _time.sleep(0.2)
+        _os.close(master)  # hangup: slave reads now fail and the gateway exits
+        out, err = proc.communicate(timeout=30)
+    finally:
+        _os.close(slave)
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    check("pty_live", proc.returncode == 0, "gateway exits cleanly on tty hangup")
+    text = out.decode()
+    m = NODE_RE.search(text)
+    check("pty_live", m is not None and m.group(2) == "6" and m.group(12) == "6",
+          "all 6 frames accepted over the PTY")
+    check("pty_live", "temp=33.38" in text and "hum=7.72" in text,
+          "frame with NL/CR/VINTR/VEOF bytes arrives unmangled")
+    agg = [l for l in text.splitlines() if l.startswith("[aggregate]")]
+    check("pty_live", len(agg) == 2, "periodic aggregates published live (FR-3)")
+
+    # SR-3 on a live tty runs on the wall clock, not synthetic per-chunk
+    # ticks: drain the burst bucket (100 frames), wait 1.2 real seconds
+    # (refill 20 tokens/s -> ~24 tokens), then 20 more frames must be
+    # accepted. Under synthetic ticks the wait would refill ~nothing and
+    # the tail would be rate-limited.
+    master, slave = _pty.openpty()
+    _tty.setraw(slave)
+    proc = subprocess.Popen([gw, "--read", _os.ttyname(slave)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        _time.sleep(0.1)
+        for s in range(1, 101):
+            _os.write(master, frame(1, s))
+        _time.sleep(1.2)
+        for s in range(101, 121):
+            _os.write(master, frame(1, s))
+        _time.sleep(0.2)
+        _os.close(master)
+        out, err = proc.communicate(timeout=30)
+    finally:
+        _os.close(slave)
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    m = NODE_RE.search(out.decode())
+    valid = int(m.group(2)) if m else 0
+    check("pty_live", valid >= 110,
+          f"token bucket refills on wall clock while idle (valid={valid})")
+
+
 def scenario_aggregate_publish(gw):
     print("scenario: periodic aggregate publishing (FR-3)")
     # Node 1: three readings, a version report (carries no sensor payload, so
@@ -339,7 +412,7 @@ def main():
                      scenario_out_of_range, scenario_reserved, scenario_replay,
                      scenario_garbage_resync, scenario_flood, scenario_garbage_flood,
                      scenario_firmware_version, scenario_aggregate_publish,
-                     scenario_metrics_export, scenario_auth):
+                     scenario_metrics_export, scenario_auth, scenario_pty_live):
         scenario(gw)
     if FAILURES:
         print(f"\n{len(FAILURES)} scenario check(s) FAILED:")
